@@ -215,6 +215,38 @@ const tools = [
       required: ['summary', 'startTime', 'endTime'],
     },
   },
+  {
+    name: 'web_search',
+    description: 'Search the web for information on a topic. Use this for research tasks to find current news, articles, and information.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        query: {
+          type: 'string',
+          description: 'The search query to find information about',
+        },
+        maxResults: {
+          type: 'number',
+          description: 'Maximum number of results to return (default 5)',
+        },
+      },
+      required: ['query'],
+    },
+  },
+  {
+    name: 'fetch_webpage',
+    description: 'Fetch and read the content of a webpage. Use this to get detailed information from a specific URL.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        url: {
+          type: 'string',
+          description: 'The URL of the webpage to fetch',
+        },
+      },
+      required: ['url'],
+    },
+  },
 ];
 
 async function executeTool(toolName, toolInput, userEmail) {
@@ -378,6 +410,110 @@ async function executeTool(toolName, toolInput, userEmail) {
       };
     }
 
+    case 'web_search': {
+      const query = encodeURIComponent(toolInput.query);
+      const maxResults = toolInput.maxResults || 5;
+
+      try {
+        // Use DuckDuckGo HTML search
+        const searchUrl = `https://html.duckduckgo.com/html/?q=${query}`;
+        const response = await fetch(searchUrl, {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+          },
+        });
+        const html = await response.text();
+
+        // Parse results from HTML
+        const results = [];
+        const resultRegex = /<a class="result__a" href="([^"]+)"[^>]*>([^<]+)<\/a>[\s\S]*?<a class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g;
+        let match;
+
+        while ((match = resultRegex.exec(html)) !== null && results.length < maxResults) {
+          const url = match[1];
+          const title = match[2].replace(/<[^>]+>/g, '').trim();
+          const snippet = match[3].replace(/<[^>]+>/g, '').trim();
+
+          if (url && title) {
+            results.push({ title, url, snippet });
+          }
+        }
+
+        // Fallback: try alternative parsing if no results
+        if (results.length === 0) {
+          const altRegex = /<a rel="nofollow" class="result__url" href="([^"]+)"[^>]*>([^<]+)<\/a>/g;
+          while ((match = altRegex.exec(html)) !== null && results.length < maxResults) {
+            results.push({
+              title: match[2].trim(),
+              url: match[1],
+              snippet: 'No snippet available',
+            });
+          }
+        }
+
+        return {
+          query: toolInput.query,
+          results,
+          count: results.length,
+        };
+      } catch (error) {
+        return { error: `Web search failed: ${error.message}` };
+      }
+    }
+
+    case 'fetch_webpage': {
+      try {
+        const response = await fetch(toolInput.url, {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          },
+          timeout: 10000,
+        });
+
+        if (!response.ok) {
+          return { error: `Failed to fetch: HTTP ${response.status}` };
+        }
+
+        const html = await response.text();
+
+        // Extract text content from HTML
+        let text = html
+          // Remove scripts and styles
+          .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+          .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+          // Remove HTML tags
+          .replace(/<[^>]+>/g, ' ')
+          // Decode HTML entities
+          .replace(/&nbsp;/g, ' ')
+          .replace(/&amp;/g, '&')
+          .replace(/&lt;/g, '<')
+          .replace(/&gt;/g, '>')
+          .replace(/&quot;/g, '"')
+          // Clean up whitespace
+          .replace(/\s+/g, ' ')
+          .trim();
+
+        // Limit content length
+        if (text.length > 8000) {
+          text = text.substring(0, 8000) + '... [content truncated]';
+        }
+
+        // Try to extract title
+        const titleMatch = html.match(/<title[^>]*>([^<]+)<\/title>/i);
+        const title = titleMatch ? titleMatch[1].trim() : 'Unknown';
+
+        return {
+          url: toolInput.url,
+          title,
+          content: text,
+          contentLength: text.length,
+        };
+      } catch (error) {
+        return { error: `Failed to fetch webpage: ${error.message}` };
+      }
+    }
+
     default:
       return { error: `Unknown tool: ${toolName}` };
   }
@@ -398,18 +534,53 @@ app.post('/agent/execute', async (req, res) => {
     sendEvent('log', { message: `Starting task execution...`, type: 'info', timestamp: new Date().toISOString() });
     sendEvent('log', { message: `Agent "${agentName}" (${agentRole}) is analyzing the task...`, type: 'info', timestamp: new Date().toISOString() });
 
+    // Role-specific instructions
+    const isResearchRole = agentRole.toLowerCase().includes('research') || agentName.toLowerCase().includes('research');
+    const isEmailRole = agentRole.toLowerCase().includes('email') || agentRole.toLowerCase().includes('communication') || agentRole.toLowerCase().includes('assistant');
+    const isCalendarRole = agentRole.toLowerCase().includes('calendar') || agentRole.toLowerCase().includes('schedule');
+
+    let roleInstructions = '';
+    if (isResearchRole) {
+      roleInstructions = `
+As a Research Analyst, your primary tools are:
+- web_search: Search the internet for current information, news, and articles
+- fetch_webpage: Read full content from specific URLs you find
+
+DO NOT use email or calendar tools. Focus on web research to gather information and provide comprehensive reports.
+When researching, search for multiple sources and synthesize the information into a clear summary.`;
+    } else if (isEmailRole) {
+      roleInstructions = `
+Your primary tools for communication tasks are:
+- get_emails: Read emails from the inbox
+- send_email: Send emails to recipients
+
+Available integrations:
+- Gmail: ${userEmail ? 'Connected as ' + userEmail : 'Not connected'}`;
+    } else if (isCalendarRole) {
+      roleInstructions = `
+Your primary tools for scheduling tasks are:
+- get_calendar_events: View upcoming calendar events
+- create_calendar_event: Create new calendar events
+
+Available integrations:
+- Google Calendar: ${userEmail ? 'Connected as ' + userEmail : 'Not connected'}`;
+    } else {
+      roleInstructions = `
+Available integrations:
+- Gmail: ${userEmail ? 'Connected as ' + userEmail : 'Not connected'}
+- Google Calendar: ${userEmail ? 'Connected as ' + userEmail : 'Not connected'}
+- Web Research: Always available (web_search, fetch_webpage)`;
+    }
+
     const systemPrompt = `You are ${agentName}, an AI agent with the role of ${agentRole}.
 You are executing a task scheduled by your user on their AgentTime calendar.
 
 Your job is to:
 1. Understand the task thoroughly
-2. Use the available tools to complete it
+2. Use the appropriate tools for your role to complete it
 3. Log your progress using the log_progress tool
 4. Be thorough but efficient
-
-Available integrations:
-- Gmail: ${userEmail ? 'Connected as ' + userEmail : 'Not connected'}
-- Google Calendar: ${userEmail ? 'Connected as ' + userEmail : 'Not connected'}
+${roleInstructions}
 
 Always start by logging what you're about to do, then execute, then log the result.
 If an integration is not connected but needed, inform the user via a log message.
@@ -417,7 +588,8 @@ If an integration is not connected but needed, inform the user via a log message
 When presenting results, use markdown formatting for better readability:
 - Use **bold** for important items
 - Use bullet points for lists
-- Use code blocks for technical content`;
+- Use \`code\` for technical terms
+- Use headers (##) to organize sections`;
 
     let messages = [{ role: 'user', content: `Execute this task: ${task}` }];
     let continueLoop = true;
@@ -458,6 +630,10 @@ When presenting results, use markdown formatting for better readability:
               sendEvent('log', { message: `Retrieved ${result.events.length} calendar events`, type: 'success', timestamp: new Date().toISOString() });
             } else if (block.name === 'create_calendar_event' && result.success) {
               sendEvent('log', { message: `Calendar event created: "${result.summary}"`, type: 'success', timestamp: new Date().toISOString() });
+            } else if (block.name === 'web_search' && result.results) {
+              sendEvent('log', { message: `Found ${result.count} search results for "${result.query}"`, type: 'success', timestamp: new Date().toISOString() });
+            } else if (block.name === 'fetch_webpage' && result.content) {
+              sendEvent('log', { message: `Fetched webpage: "${result.title}" (${result.contentLength} chars)`, type: 'success', timestamp: new Date().toISOString() });
             } else if (result.error) {
               sendEvent('log', { message: `Tool error: ${result.error}`, type: 'error', timestamp: new Date().toISOString() });
             }
