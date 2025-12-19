@@ -96,14 +96,14 @@ export async function executeAgentTask(
         if (line.startsWith('data: ')) {
           try {
             const data = JSON.parse(line.slice(6));
-            if (data.type === 'log') {
+            if (data.eventType === 'log') {
               onLog({
                 id: `log-${++logCounter}`,
                 timestamp: data.timestamp,
                 message: data.message,
-                type: data.type === 'log' ? (data.type as any) : data.type,
+                type: data.type || 'info',
               });
-            } else if (data.type === 'complete') {
+            } else if (data.eventType === 'complete') {
               onComplete(data.success);
             }
           } catch (e) {

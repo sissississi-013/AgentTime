@@ -5,6 +5,7 @@ import { google } from 'googleapis';
 import Anthropic from '@anthropic-ai/sdk';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
+import { readFileSync, writeFileSync, existsSync } from 'fs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -16,6 +17,7 @@ app.use(cors({ origin: process.env.FRONTEND_URL || 'http://localhost:3000', cred
 app.use(express.json());
 
 const PORT = process.env.PORT || 3001;
+const TOKEN_FILE = join(__dirname, '.tokens.json');
 
 const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY,
@@ -27,13 +29,37 @@ const oauth2Client = new google.auth.OAuth2(
   `http://localhost:${PORT}/auth/google/callback`
 );
 
-const tokenStore = new Map();
+// Persist tokens to file so they survive server restarts
+const loadTokens = () => {
+  try {
+    if (existsSync(TOKEN_FILE)) {
+      const data = JSON.parse(readFileSync(TOKEN_FILE, 'utf-8'));
+      return new Map(Object.entries(data));
+    }
+  } catch (e) {
+    console.error('Failed to load tokens:', e.message);
+  }
+  return new Map();
+};
+
+const saveTokens = (store) => {
+  try {
+    const obj = Object.fromEntries(store);
+    writeFileSync(TOKEN_FILE, JSON.stringify(obj, null, 2));
+  } catch (e) {
+    console.error('Failed to save tokens:', e.message);
+  }
+};
+
+const tokenStore = loadTokens();
 
 app.get('/auth/google', (req, res) => {
   const scopes = [
     'https://www.googleapis.com/auth/gmail.readonly',
     'https://www.googleapis.com/auth/gmail.send',
     'https://www.googleapis.com/auth/gmail.modify',
+    'https://www.googleapis.com/auth/calendar.readonly',
+    'https://www.googleapis.com/auth/calendar.events',
     'https://www.googleapis.com/auth/userinfo.email',
     'https://www.googleapis.com/auth/userinfo.profile',
   ];
@@ -62,6 +88,7 @@ app.get('/auth/google/callback', async (req, res) => {
       tokens,
       userInfo: userInfo.data,
     });
+    saveTokens(tokenStore);
 
     const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
     res.redirect(`${frontendUrl}?auth=success&email=${encodeURIComponent(userId)}&name=${encodeURIComponent(userInfo.data.name || '')}`);
@@ -91,6 +118,7 @@ app.post('/auth/google/disconnect', (req, res) => {
   const { email } = req.body;
   if (email && tokenStore.has(email)) {
     tokenStore.delete(email);
+    saveTokens(tokenStore);
     res.json({ success: true });
   } else {
     res.json({ success: false, error: 'Not connected' });
@@ -139,6 +167,52 @@ const tools = [
         type: { type: 'string', enum: ['info', 'success', 'warning', 'error'], description: 'Type of log message' },
       },
       required: ['message'],
+    },
+  },
+  {
+    name: 'get_calendar_events',
+    description: 'Retrieve events from Google Calendar. Can specify time range and calendar.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        timeMin: {
+          type: 'string',
+          description: 'Start time for events (ISO 8601 format, e.g., "2024-01-15T00:00:00Z"). Defaults to now.',
+        },
+        timeMax: {
+          type: 'string',
+          description: 'End time for events (ISO 8601 format). Defaults to 7 days from now.',
+        },
+        maxResults: {
+          type: 'number',
+          description: 'Maximum number of events to retrieve (default 10)',
+        },
+        calendarId: {
+          type: 'string',
+          description: 'Calendar ID to query (default "primary")',
+        },
+      },
+      required: [],
+    },
+  },
+  {
+    name: 'create_calendar_event',
+    description: 'Create a new event on Google Calendar',
+    input_schema: {
+      type: 'object',
+      properties: {
+        summary: { type: 'string', description: 'Event title/summary' },
+        description: { type: 'string', description: 'Event description' },
+        startTime: { type: 'string', description: 'Start time (ISO 8601 format, e.g., "2024-01-15T10:00:00-08:00")' },
+        endTime: { type: 'string', description: 'End time (ISO 8601 format)' },
+        location: { type: 'string', description: 'Event location (optional)' },
+        attendees: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'List of attendee email addresses (optional)',
+        },
+      },
+      required: ['summary', 'startTime', 'endTime'],
     },
   },
 ];
@@ -226,6 +300,84 @@ async function executeTool(toolName, toolInput, userEmail) {
       return { logged: true, message: toolInput.message, type: toolInput.type || 'info' };
     }
 
+    case 'get_calendar_events': {
+      if (!userEmail || !tokenStore.has(userEmail)) {
+        return { error: 'Google Calendar not connected. Please connect your Google account first.' };
+      }
+      const { tokens } = tokenStore.get(userEmail);
+      oauth2Client.setCredentials(tokens);
+
+      const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
+
+      const now = new Date();
+      const weekFromNow = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
+
+      const response = await calendar.events.list({
+        calendarId: toolInput.calendarId || 'primary',
+        timeMin: toolInput.timeMin || now.toISOString(),
+        timeMax: toolInput.timeMax || weekFromNow.toISOString(),
+        maxResults: toolInput.maxResults || 10,
+        singleEvents: true,
+        orderBy: 'startTime',
+      });
+
+      const events = (response.data.items || []).map(event => ({
+        id: event.id,
+        summary: event.summary,
+        description: event.description,
+        location: event.location,
+        start: event.start?.dateTime || event.start?.date,
+        end: event.end?.dateTime || event.end?.date,
+        attendees: event.attendees?.map(a => ({ email: a.email, name: a.displayName, status: a.responseStatus })),
+        htmlLink: event.htmlLink,
+      }));
+
+      return { events, count: events.length };
+    }
+
+    case 'create_calendar_event': {
+      if (!userEmail || !tokenStore.has(userEmail)) {
+        return { error: 'Google Calendar not connected. Please connect your Google account first.' };
+      }
+      const { tokens } = tokenStore.get(userEmail);
+      oauth2Client.setCredentials(tokens);
+
+      const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
+
+      const event = {
+        summary: toolInput.summary,
+        description: toolInput.description,
+        location: toolInput.location,
+        start: {
+          dateTime: toolInput.startTime,
+          timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        },
+        end: {
+          dateTime: toolInput.endTime,
+          timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        },
+      };
+
+      if (toolInput.attendees && toolInput.attendees.length > 0) {
+        event.attendees = toolInput.attendees.map(email => ({ email }));
+      }
+
+      const response = await calendar.events.insert({
+        calendarId: 'primary',
+        requestBody: event,
+        sendUpdates: toolInput.attendees ? 'all' : 'none',
+      });
+
+      return {
+        success: true,
+        eventId: response.data.id,
+        htmlLink: response.data.htmlLink,
+        summary: response.data.summary,
+        start: response.data.start?.dateTime,
+        end: response.data.end?.dateTime,
+      };
+    }
+
     default:
       return { error: `Unknown tool: ${toolName}` };
   }
@@ -238,8 +390,8 @@ app.post('/agent/execute', async (req, res) => {
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
 
-  const sendEvent = (type, data) => {
-    res.write(`data: ${JSON.stringify({ type, ...data })}\n\n`);
+  const sendEvent = (eventType, data) => {
+    res.write(`data: ${JSON.stringify({ eventType, ...data })}\n\n`);
   };
 
   try {
@@ -257,9 +409,15 @@ Your job is to:
 
 Available integrations:
 - Gmail: ${userEmail ? 'Connected as ' + userEmail : 'Not connected'}
+- Google Calendar: ${userEmail ? 'Connected as ' + userEmail : 'Not connected'}
 
 Always start by logging what you're about to do, then execute, then log the result.
-If Gmail is not connected but needed, inform the user via a log message.`;
+If an integration is not connected but needed, inform the user via a log message.
+
+When presenting results, use markdown formatting for better readability:
+- Use **bold** for important items
+- Use bullet points for lists
+- Use code blocks for technical content`;
 
     let messages = [{ role: 'user', content: `Execute this task: ${task}` }];
     let continueLoop = true;
@@ -296,6 +454,10 @@ If Gmail is not connected but needed, inform the user via a log message.`;
               sendEvent('log', { message: `Retrieved ${result.emails.length} emails (${result.count} total matching)`, type: 'success', timestamp: new Date().toISOString() });
             } else if (block.name === 'send_email' && result.success) {
               sendEvent('log', { message: `Email sent successfully`, type: 'success', timestamp: new Date().toISOString() });
+            } else if (block.name === 'get_calendar_events' && result.events) {
+              sendEvent('log', { message: `Retrieved ${result.events.length} calendar events`, type: 'success', timestamp: new Date().toISOString() });
+            } else if (block.name === 'create_calendar_event' && result.success) {
+              sendEvent('log', { message: `Calendar event created: "${result.summary}"`, type: 'success', timestamp: new Date().toISOString() });
             } else if (result.error) {
               sendEvent('log', { message: `Tool error: ${result.error}`, type: 'error', timestamp: new Date().toISOString() });
             }

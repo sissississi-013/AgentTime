@@ -2,8 +2,9 @@ import React, { useState, useEffect, useRef } from 'react';
 import { CalendarEvent, Agent, LogEntry, EventStatus, EventCategory } from '../types';
 import { X, Play, Clock, CheckSquare, Square, Terminal, Wand2, Wifi, WifiOff, Bot } from 'lucide-react';
 import { format } from 'date-fns';
+import ReactMarkdown from 'react-markdown';
 import { classifyTask } from '../services/geminiService';
-import { executeAgentTask, checkServerHealth } from '../services/api';
+import { executeAgentTask, checkServerHealth, checkGoogleAuth } from '../services/api';
 
 const CATEGORY_STYLES: Record<string, string> = {
   communication: 'bg-gradient-to-br from-indigo-500 to-violet-600 border-indigo-400/30',
@@ -48,6 +49,7 @@ const EventModal: React.FC<EventModalProps> = ({
   const [category, setCategory] = useState<EventCategory>(event.category);
   const [isProcessing, setIsProcessing] = useState(false);
   const [serverOnline, setServerOnline] = useState<boolean | null>(null);
+  const [gmailValid, setGmailValid] = useState<boolean | null>(null);
   const [currentAgentIndex, setCurrentAgentIndex] = useState(0);
   const logsEndRef = useRef<HTMLDivElement>(null);
 
@@ -59,11 +61,20 @@ const EventModal: React.FC<EventModalProps> = ({
       setLogs(event.logs);
       setCategory(event.category || 'other');
       setCurrentAgentIndex(0);
+      setGmailValid(null);
+
       checkServerHealth().then(health => {
         setServerOnline(health !== null && health.anthropicConfigured);
       });
+
+      // Verify Gmail is actually valid on the backend
+      if (googleUserEmail) {
+        checkGoogleAuth(googleUserEmail).then(user => {
+          setGmailValid(user !== null);
+        });
+      }
     }
-  }, [event, isOpen]);
+  }, [event, isOpen, googleUserEmail]);
 
   useEffect(() => {
     logsEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -186,8 +197,8 @@ const EventModal: React.FC<EventModalProps> = ({
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 backdrop-blur-sm p-4 transition-all">
-      <div className="bg-white/80 backdrop-blur-xl border border-white/20 rounded-2xl shadow-2xl w-full max-w-2xl overflow-hidden flex flex-col max-h-[90vh]">
-        <div className="px-6 py-4 border-b border-gray-200/50 flex justify-between items-center bg-white/50">
+      <div className="bg-white/80 backdrop-blur-xl border border-white/20 rounded-2xl shadow-2xl w-full max-w-5xl flex flex-col max-h-[90vh] h-[85vh]">
+        <div className="px-6 py-4 border-b border-gray-200/50 flex justify-between items-center bg-white/50 flex-shrink-0">
           <div className="flex items-center gap-3">
             <div className="flex items-center gap-2 text-slate-500 text-sm font-medium bg-slate-100/50 px-3 py-1 rounded-full">
               <Clock className="w-4 h-4" />
@@ -212,8 +223,8 @@ const EventModal: React.FC<EventModalProps> = ({
           </button>
         </div>
 
-        <div className="flex flex-col md:flex-row h-full overflow-hidden">
-          <div className="p-6 flex-1 flex flex-col gap-6 overflow-y-auto">
+        <div className="flex flex-col md:flex-row flex-1 min-h-0 overflow-hidden">
+          <div className="p-6 flex-1 flex flex-col gap-6 overflow-y-auto min-h-0">
             <div className="group">
               <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-2">Task Directive</label>
               <input
@@ -274,6 +285,13 @@ const EventModal: React.FC<EventModalProps> = ({
               </div>
             )}
 
+            {googleUserEmail && gmailValid === false && (
+              <div className="bg-red-50 border border-red-200 rounded-xl p-4 text-sm text-red-800">
+                <p className="font-semibold">Gmail session expired</p>
+                <p className="mt-1 text-red-700">Please reconnect your Google account in the sidebar to enable email tasks.</p>
+              </div>
+            )}
+
             <div className="mt-auto flex gap-3 pt-6 border-t border-slate-200/60">
               <button
                 onClick={handleSave}
@@ -290,8 +308,8 @@ const EventModal: React.FC<EventModalProps> = ({
             </div>
           </div>
 
-          <div className="w-full md:w-96 bg-slate-50/50 border-l border-slate-200/60 flex flex-col h-full backdrop-blur-sm">
-            <div className="p-4 border-b border-slate-200/60 bg-white/40">
+          <div className="w-full md:w-[480px] bg-slate-50/50 border-l border-slate-200/60 flex flex-col min-h-0 backdrop-blur-sm">
+            <div className="p-4 border-b border-slate-200/60 bg-white/40 flex-shrink-0">
               <div className="flex justify-between items-center mb-4">
                 <h3 className="text-xs font-bold text-slate-900 uppercase tracking-widest">Live Output</h3>
                 <span className={`px-2 py-0.5 rounded-md text-[10px] font-bold border ${
@@ -347,7 +365,7 @@ const EventModal: React.FC<EventModalProps> = ({
               </button>
             </div>
 
-            <div className="flex-1 overflow-y-auto p-4 space-y-4">
+            <div className="flex-1 overflow-y-auto p-4 space-y-4 min-h-0">
               {logs.length === 0 ? (
                 <div className="h-full flex flex-col items-center justify-center text-center text-slate-400">
                   <div className="w-16 h-16 rounded-2xl bg-slate-100 border border-slate-200 flex items-center justify-center mb-3">
@@ -389,7 +407,9 @@ const EventModal: React.FC<EventModalProps> = ({
                             'bg-indigo-500'
                           }`} />
                         </div>
-                        <p className="text-sm text-slate-700 leading-relaxed">{log.message}</p>
+                        <div className="text-sm text-slate-700 leading-relaxed markdown-content">
+                          <ReactMarkdown>{log.message}</ReactMarkdown>
+                        </div>
                       </div>
                     </div>
                   ))}
