@@ -1,0 +1,5 @@
+{
+  "name": "AgentTime",
+  "description": "An intelligent calendar interface for scheduling and coordinating AI agents to execute tasks with temporal awareness and detailed execution logs.",
+  "requestFramePermissions": []
+}
